@@ -22,17 +22,18 @@ _conn = None
 _next_check = 0.0
 
 
+class StoreError(Exception):
+    """Store failure from lookup: the store can't be read or holds no dataset yet."""
+
+
 class _Stopped(Exception):
     """Stop request from Kodi or the caller, raised inside a load."""
 
 
 def get_rating(imdb_id: Optional[str]) -> Optional[Tuple[float, int]]:
     """Get the rating and vote count of an IMDb title, updating the store first when it is due."""
-    if not imdb_id or not imdb_id.startswith('tt'):
-        return None
-    try:
-        title = int(imdb_id[2:])
-    except ValueError:
+    title = _title_number(imdb_id)
+    if title is None:
         return None
     conn = _connect()
     if conn is None:
@@ -40,11 +41,26 @@ def get_rating(imdb_id: Optional[str]) -> Optional[Tuple[float, int]]:
     if time.time() >= _next_check:
         _update(conn)
     try:
-        row = conn.execute('SELECT rating, votes FROM ratings WHERE id = ?', (title,)).fetchone()
+        return _stored(conn, title)
     except sqlite3.Error as exc:
         _log(f'lookup failed: {exc}', xbmc.LOGERROR)
         return None
-    return (row[0] / 10, row[1]) if row else None
+
+
+def lookup(imdb_id: Optional[str]) -> Optional[Tuple[float, int]]:
+    """Look up a stored rating without updating; raises StoreError when the store can't answer."""
+    title = _title_number(imdb_id)
+    if title is None:
+        return None
+    conn = _open()
+    try:
+        rating = _stored(conn, title)
+        loaded = rating is not None or _meta(conn, 'modified') is not None
+    except sqlite3.Error as exc:
+        raise StoreError(f'lookup failed: {exc}') from exc
+    if not loaded:
+        raise StoreError('no dataset loaded yet')
+    return rating
 
 
 def refresh(abort: Optional[Callable[[], bool]] = None,
@@ -66,8 +82,33 @@ def dataset_date() -> Optional[str]:
         return None
 
 
+def _title_number(imdb_id: Optional[str]) -> Optional[int]:
+    """Number part of an IMDb title id, or None when it isn't one."""
+    if not imdb_id or not imdb_id.startswith('tt'):
+        return None
+    try:
+        return int(imdb_id[2:])
+    except ValueError:
+        return None
+
+
+def _stored(conn: sqlite3.Connection, title: int) -> Optional[Tuple[float, int]]:
+    """Rating and vote count stored for a title number, or None."""
+    row = conn.execute('SELECT rating, votes FROM ratings WHERE id = ?', (title,)).fetchone()
+    return (row[0] / 10, row[1]) if row else None
+
+
 def _connect() -> Optional[sqlite3.Connection]:
-    """Open the store once per interpreter, creating its tables on first use."""
+    """Connect to the store, logging a failure and returning None instead of raising."""
+    try:
+        return _open()
+    except StoreError as exc:
+        _log(str(exc), xbmc.LOGERROR)
+        return None
+
+
+def _open() -> sqlite3.Connection:
+    """Open the store once per interpreter, creating its tables on first use; raises StoreError."""
     global _conn, _next_check
     if _conn is not None:
         return _conn
@@ -77,8 +118,7 @@ def _connect() -> Optional[sqlite3.Connection]:
         _create(conn)
         _next_check = _due(conn)
     except sqlite3.Error as exc:
-        _log(f'cannot open the store: {exc}', xbmc.LOGERROR)
-        return None
+        raise StoreError(f'cannot open the store: {exc}') from exc
     _conn = conn
     return conn
 
