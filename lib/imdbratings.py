@@ -2,6 +2,7 @@
 
 import gzip
 import io
+import os
 import sqlite3
 import threading
 import time
@@ -24,6 +25,7 @@ _SCHEMA = 1
 _local = threading.local()
 _next_check = 0.0
 _stopped_until = 0.0
+_logged = set()
 # made at import, a Monitor created after Kodi's abort notice never reports it
 _monitor = xbmc.Monitor()
 
@@ -37,10 +39,11 @@ class _Stopped(Exception):
 
 
 class _Holder:
-    """One thread's store connection, closed when the thread ends."""
+    """One thread's store connection and the file it opened, closed when the thread ends."""
 
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, inode: Optional[int]):
         self.conn = conn
+        self.inode = inode
 
     def __del__(self):
         self.conn.close()
@@ -52,14 +55,17 @@ def get_rating(imdb_id: Optional[str]) -> Optional[Tuple[float, int]]:
     if title is None:
         return None
     conn = _connect()
+    if conn is not None and time.time() >= _next_check:
+        _update(conn)
+        # an update that repaired a damaged store dropped the connection
+        conn = _connect()
     if conn is None:
         return None
-    if time.time() >= _next_check:
-        _update(conn)
     try:
         return _stored(conn, title)
     except sqlite3.Error as exc:
-        _log(f'lookup failed: {exc}', xbmc.LOGERROR)
+        _log_error(f'lookup failed: {exc}')
+        _mend(exc)
         return None
 
 
@@ -73,6 +79,7 @@ def lookup(imdb_id: Optional[str]) -> Optional[Tuple[float, int]]:
         rating = _stored(conn, title)
         loaded = rating is not None or _meta(conn, 'modified') is not None
     except sqlite3.Error as exc:
+        _mend(exc)
         raise StoreError(f'lookup failed: {exc}') from exc
     if not loaded:
         raise StoreError('no dataset loaded yet')
@@ -96,7 +103,8 @@ def dataset_date() -> Optional[str]:
     try:
         return _meta(conn, 'modified')
     except sqlite3.Error as exc:
-        _log(f'date lookup failed: {exc}', xbmc.LOGERROR)
+        _log_error(f'date lookup failed: {exc}')
+        _mend(exc)
         return None
 
 
@@ -125,27 +133,109 @@ def _connect() -> Optional[sqlite3.Connection]:
     try:
         return _open()
     except StoreError as exc:
-        _log(str(exc), xbmc.LOGERROR)
+        _log_error(str(exc))
         return None
 
 
-def _open() -> sqlite3.Connection:
-    """Open the store once per thread; creates tables, seeds next check time, raises StoreError."""
+def _open(retry: bool = True) -> sqlite3.Connection:
+    """Open the store once per thread; creates, repairs, seeds next check, raises StoreError."""
     global _next_check
     holder = getattr(_local, 'holder', None)
     if holder is not None:
         return holder.conn
+    path = xbmcvfs.translatePath(_STORE)
+    inode = _inode(path)
+    conn = None
     try:
-        conn = sqlite3.connect(xbmcvfs.translatePath(_STORE), timeout=5, isolation_level=None)
+        conn = sqlite3.connect(path, timeout=5, isolation_level=None)
         conn.execute('PRAGMA journal_mode = WAL')
         _create(conn)
         if not _next_check:
             # once per interpreter, or each new thread waits out a busy store again
             _next_check = _due(conn)
     except sqlite3.Error as exc:
+        if conn is not None:
+            repaired = retry and _repair(conn, exc, inode)
+            conn.close()
+            if repaired:
+                return _open(retry=False)
         raise StoreError(f'cannot open the store: {exc}') from exc
-    _local.holder = _Holder(conn)
+    _local.holder = _Holder(conn, _inode(path))
     return conn
+
+
+def _inode(path: str) -> Optional[int]:
+    """File id of the store, or None when there is no file yet."""
+    try:
+        return os.stat(path).st_ino
+    except OSError:
+        return None
+
+
+def _damaged(exc: BaseException) -> bool:
+    """Whether an error says the store file itself is damaged, not busy or misused."""
+    # corrupt and not-a-database errors arrive as the base class, busy and locked as subclasses
+    return type(exc) is sqlite3.DatabaseError
+
+
+def _mend(exc: BaseException) -> None:
+    """Mend a damaged store after a failed call; drops this thread's connection for a new one."""
+    holder = getattr(_local, 'holder', None)
+    if holder is not None and _repair(holder.conn, exc, holder.inode):
+        del _local.holder
+
+
+def _repair(conn: sqlite3.Connection, exc: BaseException, inode: Optional[int]) -> bool:
+    """Repair a damaged store by rebuilding it empty; True when the caller should reconnect."""
+    if not _damaged(exc):
+        return False
+    try:
+        if conn.execute('PRAGMA quick_check(1)').fetchone()[0] == 'ok':
+            return True
+        _overwrite(conn)
+    except sqlite3.Error as error:
+        if not _damaged(error):
+            return False
+        # not readable as a database at all; only replacing the file helps
+        conn.close()
+        if not _discard(inode):
+            return True
+    _logged.clear()
+    _log('the store was damaged, rebuilt it empty', xbmc.LOGWARNING)
+    return True
+
+
+def _overwrite(conn: sqlite3.Connection) -> None:
+    """Overwrite the store in place with empty tables, under SQLite's locks for every add-on."""
+    fresh = sqlite3.connect(':memory:', isolation_level=None)
+    try:
+        fresh.execute('BEGIN IMMEDIATE')
+        _build(fresh)
+        deadline = time.time() + 5
+
+        def give_up(status: int, remaining: int, total: int) -> None:
+            if time.time() > deadline:
+                raise sqlite3.OperationalError('store busy')
+
+        fresh.backup(conn, progress=give_up)
+    finally:
+        fresh.close()
+
+
+def _discard(inode: Optional[int]) -> bool:
+    """Discard an unreadable store file unless another add-on replaced it; True when gone."""
+    path = xbmcvfs.translatePath(_STORE)
+    if inode is None:
+        return False
+    if _inode(path) == inode:
+        try:
+            for name in (path, path + '-wal', path + '-shm'):
+                if os.path.exists(name):
+                    os.remove(name)
+        except OSError as exc:
+            _log_error(f'cannot replace the unreadable store: {exc}')
+            return False
+    return True
 
 
 def _create(conn: sqlite3.Connection) -> None:
@@ -193,13 +283,14 @@ def _due(conn: sqlite3.Connection) -> float:
 
 def _update(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]] = None,
             on_download: Optional[Callable[[], None]] = None) -> bool:
-    """Update the ratings when a check is due and the lock is free; True when new data loaded."""
+    """Update ratings when check is due and lock free, mending damage; True when new data loaded."""
     global _next_check, _stopped_until
     _next_check = time.time() + _CHECK_GAP
     try:
         conn.execute('BEGIN IMMEDIATE')
-    except sqlite3.OperationalError:
-        _log('store busy, update skipped')
+    except sqlite3.Error as exc:
+        _log(f'update skipped: {exc}')
+        _mend(exc)
         return False
     loaded = False
     try:
@@ -218,6 +309,9 @@ def _update(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]] = None
         loaded = False
         if conn.in_transaction:
             conn.execute('ROLLBACK')
+        if _damaged(exc):
+            _mend(exc)
+            return False
     except BaseException:
         # Kodi's kill raises SystemExit anywhere; a caller that swallows it would keep the lock
         if conn.in_transaction:
@@ -230,7 +324,7 @@ def _update(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]] = None
 
 def _reload(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]],
             on_download: Optional[Callable[[], None]]) -> bool:
-    """Reload ratings from a newer IMDb file; True on load, failure sets retry wait, stop raises."""
+    """Reload newer IMDb ratings; True on load, stop or damage raises, else failure sets retry."""
     modified = _remote_modified()
     if not modified or not _newer(modified, _meta(conn, 'modified')):
         return False
@@ -274,6 +368,8 @@ def _reload(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]],
     except _Stopped:
         raise
     except Exception as exc:
+        if _damaged(exc):
+            raise
         _log(f'download failed: {exc}', xbmc.LOGERROR)
         conn.execute('ROLLBACK TO reload')
         conn.execute("INSERT OR REPLACE INTO meta VALUES ('retry', ?)",
@@ -327,3 +423,10 @@ def _meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
 def _log(message: str, level: int = xbmc.LOGDEBUG) -> None:
     """Log under the module's id."""
     xbmc.log(f'[{_ADDON_ID}] {message}', level)
+
+
+def _log_error(message: str) -> None:
+    """Log a store error at error level the first time this interpreter sees it, then at debug."""
+    level = xbmc.LOGDEBUG if message in _logged else xbmc.LOGERROR
+    _logged.add(message)
+    _log(message, level)
