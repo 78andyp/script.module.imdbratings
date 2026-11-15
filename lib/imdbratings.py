@@ -229,8 +229,18 @@ def _reload(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]],
     if not modified or not _newer(modified, _meta(conn, 'modified')):
         return False
 
+    callback = abort
+
     def stopped() -> bool:
-        return _monitor.abortRequested() or (abort is not None and abort())
+        nonlocal callback
+        if _monitor.abortRequested():
+            return True
+        try:
+            return callback is not None and bool(callback())
+        except Exception as exc:
+            _log(f'abort callback failed, ignoring it: {exc}', xbmc.LOGERROR)
+            callback = None
+            return False
 
     if stopped():
         raise _Stopped()

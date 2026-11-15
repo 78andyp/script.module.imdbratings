@@ -46,6 +46,8 @@ Optional arguments:
 | `abort` | Called during a download. Return `True` to stop it; the previous ratings stay. |
 | `on_download` | Called once, before a download begins. |
 
+An exception from either callback is logged and the download goes on.
+
 A download also stops when Kodi shuts down.
 
 ## Look up without updating
