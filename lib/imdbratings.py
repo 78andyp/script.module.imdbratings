@@ -101,12 +101,16 @@ def dataset_date() -> Optional[str]:
 
 def _title_number(imdb_id: Optional[str]) -> Optional[int]:
     """Number part of an IMDb title id, or None when it isn't one."""
-    if not imdb_id or not imdb_id.startswith('tt'):
+    if not imdb_id:
         return None
-    try:
-        return int(imdb_id[2:])
-    except ValueError:
+    text = imdb_id.strip()
+    if not text.startswith('tt'):
         return None
+    digits = text[2:]
+    # 18 digits always fit SQLite's 64-bit INTEGER
+    if not (digits.isascii() and digits.isdigit()) or len(digits) > 18:
+        return None
+    return int(digits)
 
 
 def _stored(conn: sqlite3.Connection, title: int) -> Optional[Tuple[float, int]]:
