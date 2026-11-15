@@ -22,6 +22,8 @@ _SCHEMA = 1
 _local = threading.local()
 _next_check = 0.0
 _stopped_until = 0.0
+# made at import, a Monitor created after Kodi's abort notice never reports it
+_monitor = xbmc.Monitor()
 
 
 class StoreError(Exception):
@@ -210,17 +212,18 @@ def _reload(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]],
     modified = _remote_modified()
     if not modified or modified == _meta(conn, 'modified'):
         return False
+
+    def stopped() -> bool:
+        return _monitor.abortRequested() or (abort is not None and abort())
+
+    if stopped():
+        raise _Stopped()
     _log('downloading the ratings dataset', xbmc.LOGINFO)
     if on_download is not None:
         try:
             on_download()
         except Exception as exc:
             _log(f'download callback failed: {exc}', xbmc.LOGERROR)
-    monitor = xbmc.Monitor()
-
-    def stopped() -> bool:
-        return monitor.abortRequested() or (abort is not None and abort())
-
     loaded = False
     conn.execute('SAVEPOINT reload')
     try:
