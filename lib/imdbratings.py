@@ -160,6 +160,10 @@ def _open(retry: bool = True) -> sqlite3.Connection:
             if repaired:
                 return _open(retry=False)
         raise StoreError(f'cannot open the store: {exc}') from exc
+    except BaseException:
+        if conn is not None:
+            conn.close()
+        raise
     _local.holder = _Holder(conn, _inode(path))
     return conn
 
