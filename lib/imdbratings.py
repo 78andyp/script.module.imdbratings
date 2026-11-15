@@ -1,6 +1,7 @@
 """IMDb ratings from IMDb's ratings dataset, in one local store every add-on using it shares."""
 
 import gzip
+import io
 import sqlite3
 import threading
 import time
@@ -261,7 +262,8 @@ def _reload(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]],
         # rebuilt in place, another add-on may have the file open
         conn.execute('DELETE FROM ratings')
         request = Request(_DATASET_URL, headers=_HEADERS)
-        with urlopen(request, timeout=30) as response, gzip.GzipFile(fileobj=response) as lines:
+        with urlopen(request, timeout=30) as response, gzip.GzipFile(fileobj=response) as data:
+            lines = io.TextIOWrapper(data, encoding='utf-8', errors='replace')
             rows = _rows(lines, stopped)
             count = conn.executemany('INSERT INTO ratings VALUES (?, ?, ?)', rows).rowcount
         if count <= 0:
@@ -280,14 +282,17 @@ def _reload(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]],
     return loaded
 
 
-def _rows(lines: Iterable[bytes], stopped: Callable[[], bool]) -> Iterator[Tuple[int, int, int]]:
+def _rows(lines: Iterable[str], stopped: Callable[[], bool]) -> Iterator[Tuple[int, int, int]]:
     """Title number, rating times ten and votes per line, skipping bad ones; raises on a stop."""
     for number, line in enumerate(lines):
         if number % _STOP_CHECK_LINES == 0 and stopped():
             raise _Stopped()
-        fields = line.split(b'\t')
+        fields = line.split('\t')
+        title = _title_number(fields[0])
+        if title is None:
+            continue
         try:
-            yield int(fields[0][2:]), round(float(fields[1]) * 10), int(fields[2])
+            yield title, round(float(fields[1]) * 10), int(fields[2])
         except (ValueError, IndexError):
             continue
 
