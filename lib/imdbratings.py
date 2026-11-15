@@ -4,6 +4,7 @@ import gzip
 import sqlite3
 import threading
 import time
+from email.utils import parsedate_to_datetime
 from typing import Callable, Iterable, Iterator, Optional, Tuple
 from urllib.request import Request, urlopen
 
@@ -219,9 +220,9 @@ def _update(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]] = None
 
 def _reload(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]],
             on_download: Optional[Callable[[], None]]) -> bool:
-    """Reload ratings if IMDb's file changed; True on load, failure sets retry wait, stop raises."""
+    """Reload ratings from a newer IMDb file; True on load, failure sets retry wait, stop raises."""
     modified = _remote_modified()
-    if not modified or modified == _meta(conn, 'modified'):
+    if not modified or not _newer(modified, _meta(conn, 'modified')):
         return False
 
     def stopped() -> bool:
@@ -281,6 +282,16 @@ def _remote_modified() -> Optional[str]:
     except OSError as exc:
         _log(f'dataset check failed: {exc}', xbmc.LOGERROR)
         return None
+
+
+def _newer(remote: str, stored: Optional[str]) -> bool:
+    """Whether IMDb's date is later than the stored one, or differs when either won't parse."""
+    if stored is None:
+        return True
+    try:
+        return parsedate_to_datetime(remote) > parsedate_to_datetime(stored)
+    except (TypeError, ValueError):
+        return remote != stored
 
 
 def _meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
