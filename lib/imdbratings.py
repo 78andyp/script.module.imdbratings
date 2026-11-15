@@ -174,7 +174,7 @@ def _build(conn: sqlite3.Connection) -> None:
             conn.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
             conn.execute(f'PRAGMA user_version = {_SCHEMA}')
         conn.execute('COMMIT')
-    except sqlite3.Error:
+    except BaseException:
         if conn.in_transaction:
             conn.execute('ROLLBACK')
         raise
@@ -217,6 +217,11 @@ def _update(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]] = None
         loaded = False
         if conn.in_transaction:
             conn.execute('ROLLBACK')
+    except BaseException:
+        # Kodi's kill raises SystemExit anywhere; a caller that swallows it would keep the lock
+        if conn.in_transaction:
+            conn.execute('ROLLBACK')
+        raise
     # else the WAL keeps a second copy of the ratings on disk
     conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
     return loaded
