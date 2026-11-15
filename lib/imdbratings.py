@@ -145,23 +145,34 @@ def _open() -> sqlite3.Connection:
 def _create(conn: sqlite3.Connection) -> None:
     """Create the tables empty when the store is new or older; raises StoreError on a newer one."""
     if _schema(conn) < _SCHEMA:
-        conn.execute('BEGIN IMMEDIATE')
         try:
-            # another add-on may have created them while this one waited for the lock
+            conn.execute('BEGIN IMMEDIATE')
+        except sqlite3.OperationalError:
+            # lock held by another add-on's first load, which may have made the tables
             if _schema(conn) < _SCHEMA:
-                conn.execute('DROP TABLE IF EXISTS ratings')
-                conn.execute('DROP TABLE IF EXISTS meta')
-                conn.execute('CREATE TABLE ratings '
-                             '(id INTEGER PRIMARY KEY, rating INTEGER, votes INTEGER)')
-                conn.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
-                conn.execute(f'PRAGMA user_version = {_SCHEMA}')
-            conn.execute('COMMIT')
-        except sqlite3.Error:
-            if conn.in_transaction:
-                conn.execute('ROLLBACK')
-            raise
+                raise
+        else:
+            _build(conn)
     if _schema(conn) > _SCHEMA:
         raise StoreError('the store was made by a newer version of the module')
+
+
+def _build(conn: sqlite3.Connection) -> None:
+    """Build empty tables unless another add-on just did, then commit the open transaction."""
+    try:
+        # another add-on may have created them while this one waited for the lock
+        if _schema(conn) < _SCHEMA:
+            conn.execute('DROP TABLE IF EXISTS ratings')
+            conn.execute('DROP TABLE IF EXISTS meta')
+            conn.execute('CREATE TABLE ratings '
+                         '(id INTEGER PRIMARY KEY, rating INTEGER, votes INTEGER)')
+            conn.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
+            conn.execute(f'PRAGMA user_version = {_SCHEMA}')
+        conn.execute('COMMIT')
+    except sqlite3.Error:
+        if conn.in_transaction:
+            conn.execute('ROLLBACK')
+        raise
 
 
 def _schema(conn: sqlite3.Connection) -> int:
