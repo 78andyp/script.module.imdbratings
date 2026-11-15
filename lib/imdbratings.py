@@ -2,6 +2,7 @@
 
 import gzip
 import sqlite3
+import threading
 import time
 from typing import Callable, Iterable, Iterator, Optional, Tuple
 from urllib.request import Request, urlopen
@@ -18,7 +19,7 @@ _RETRY_GAP = 6 * 3600
 _STOP_CHECK_LINES = 10000
 _SCHEMA = 1
 
-_conn = None
+_local = threading.local()
 _next_check = 0.0
 
 
@@ -28,6 +29,16 @@ class StoreError(Exception):
 
 class _Stopped(Exception):
     """Stop request from Kodi or the caller, raised inside a load."""
+
+
+class _Holder:
+    """One thread's store connection, closed when the thread ends."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def __del__(self):
+        self.conn.close()
 
 
 def get_rating(imdb_id: Optional[str]) -> Optional[Tuple[float, int]]:
@@ -108,40 +119,49 @@ def _connect() -> Optional[sqlite3.Connection]:
 
 
 def _open() -> sqlite3.Connection:
-    """Open the store once per interpreter, creating its tables on first use; raises StoreError."""
-    global _conn, _next_check
-    if _conn is not None:
-        return _conn
+    """Open the store once per thread; creates tables, seeds next check time, raises StoreError."""
+    global _next_check
+    holder = getattr(_local, 'holder', None)
+    if holder is not None:
+        return holder.conn
     try:
         conn = sqlite3.connect(xbmcvfs.translatePath(_STORE), timeout=5, isolation_level=None)
         conn.execute('PRAGMA journal_mode = WAL')
         _create(conn)
-        _next_check = _due(conn)
+        if not _next_check:
+            # once per interpreter, or each new thread waits out a busy store again
+            _next_check = _due(conn)
     except sqlite3.Error as exc:
         raise StoreError(f'cannot open the store: {exc}') from exc
-    _conn = conn
+    _local.holder = _Holder(conn)
     return conn
 
 
 def _create(conn: sqlite3.Connection) -> None:
-    """Create the tables empty when the store is new or holds another schema version."""
-    if conn.execute('PRAGMA user_version').fetchone()[0] == _SCHEMA:
-        return
-    conn.execute('BEGIN IMMEDIATE')
-    try:
-        # another add-on may have created them while this one waited for the lock
-        if conn.execute('PRAGMA user_version').fetchone()[0] != _SCHEMA:
-            conn.execute('DROP TABLE IF EXISTS ratings')
-            conn.execute('DROP TABLE IF EXISTS meta')
-            conn.execute('CREATE TABLE ratings '
-                         '(id INTEGER PRIMARY KEY, rating INTEGER, votes INTEGER)')
-            conn.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
-            conn.execute(f'PRAGMA user_version = {_SCHEMA}')
-        conn.execute('COMMIT')
-    except sqlite3.Error:
-        if conn.in_transaction:
-            conn.execute('ROLLBACK')
-        raise
+    """Create the tables empty when the store is new or older; raises StoreError on a newer one."""
+    if _schema(conn) < _SCHEMA:
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            # another add-on may have created them while this one waited for the lock
+            if _schema(conn) < _SCHEMA:
+                conn.execute('DROP TABLE IF EXISTS ratings')
+                conn.execute('DROP TABLE IF EXISTS meta')
+                conn.execute('CREATE TABLE ratings '
+                             '(id INTEGER PRIMARY KEY, rating INTEGER, votes INTEGER)')
+                conn.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
+                conn.execute(f'PRAGMA user_version = {_SCHEMA}')
+            conn.execute('COMMIT')
+        except sqlite3.Error:
+            if conn.in_transaction:
+                conn.execute('ROLLBACK')
+            raise
+    if _schema(conn) > _SCHEMA:
+        raise StoreError('the store was made by a newer version of the module')
+
+
+def _schema(conn: sqlite3.Connection) -> int:
+    """Schema version stored in the file."""
+    return conn.execute('PRAGMA user_version').fetchone()[0]
 
 
 def _due(conn: sqlite3.Connection) -> float:
