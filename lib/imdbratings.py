@@ -21,6 +21,7 @@ _SCHEMA = 1
 
 _local = threading.local()
 _next_check = 0.0
+_stopped_until = 0.0
 
 
 class StoreError(Exception):
@@ -76,7 +77,9 @@ def lookup(imdb_id: Optional[str]) -> Optional[Tuple[float, int]]:
 
 def refresh(abort: Optional[Callable[[], bool]] = None,
             on_download: Optional[Callable[[], None]] = None) -> bool:
-    """Refresh the store when a shared check is due; True when this call loaded new data."""
+    """Refresh store when shared check due and no stop lately; True when new data loaded."""
+    if time.time() < _stopped_until:
+        return False
     conn = _connect()
     return conn is not None and _update(conn, abort, on_download)
 
@@ -172,7 +175,7 @@ def _due(conn: sqlite3.Connection) -> float:
 def _update(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]] = None,
             on_download: Optional[Callable[[], None]] = None) -> bool:
     """Update the ratings when a check is due and the lock is free; True when new data loaded."""
-    global _next_check
+    global _next_check, _stopped_until
     _next_check = time.time() + _CHECK_GAP
     try:
         conn.execute('BEGIN IMMEDIATE')
@@ -186,6 +189,11 @@ def _update(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]] = None
             loaded = _reload(conn, abort, on_download)
         conn.execute('COMMIT')
         _next_check = _due(conn)
+    except _Stopped:
+        # rollback drops check stamp too, letting other add-ons check now
+        _stopped_until = time.time() + _CHECK_GAP
+        _log('load stopped, old ratings kept', xbmc.LOGINFO)
+        conn.execute('ROLLBACK')
     except Exception as exc:
         _log(f'update failed: {exc}', xbmc.LOGERROR)
         loaded = False
@@ -198,7 +206,7 @@ def _update(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]] = None
 
 def _reload(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]],
             on_download: Optional[Callable[[], None]]) -> bool:
-    """Reload the ratings if IMDb's file changed; True on a load, a failed one sets a retry wait."""
+    """Reload ratings if IMDb's file changed; True on load, failure sets retry wait, stop raises."""
     modified = _remote_modified()
     if not modified or modified == _meta(conn, 'modified'):
         return False
@@ -228,8 +236,7 @@ def _reload(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]],
         _log(f'stored {count} ratings', xbmc.LOGINFO)
         loaded = True
     except _Stopped:
-        _log('load stopped, old ratings kept', xbmc.LOGINFO)
-        conn.execute('ROLLBACK TO reload')
+        raise
     except Exception as exc:
         _log(f'download failed: {exc}', xbmc.LOGERROR)
         conn.execute('ROLLBACK TO reload')
