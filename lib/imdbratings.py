@@ -392,9 +392,12 @@ def _rows(lines: Iterable[str], stopped: Callable[[], bool]) -> Iterator[Tuple[i
         if title is None:
             continue
         try:
-            yield title, round(float(fields[1]) * 10), int(fields[2])
-        except (ValueError, IndexError):
+            rating, votes = round(float(fields[1]) * 10), int(fields[2])
+        except (ValueError, IndexError, OverflowError):
             continue
+        # one out-of-range value aborts the whole executemany
+        if max(abs(rating), abs(votes)) < 2 ** 63:
+            yield title, rating, votes
 
 
 def _remote_modified() -> Optional[str]:
