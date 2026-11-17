@@ -37,7 +37,7 @@ if dataset_date() != last_processed:
 Checks are shared by every add-on using the module:
 
 - At most one check every 15 minutes. A call inside that window returns `False` without checking.
-- After a failed download, checks pause for 6 hours.
+- After a failed download, checks pause for 6 hours. Until a first dataset loads, the pause starts at 15 minutes and doubles each time, up to 6 hours.
 
 Optional arguments:
 

@@ -376,8 +376,12 @@ def _reload(conn: sqlite3.Connection, abort: Optional[Callable[[], bool]],
             raise
         _log(f'download failed: {exc}', xbmc.LOGERROR)
         conn.execute('ROLLBACK TO reload')
-        conn.execute("INSERT OR REPLACE INTO meta VALUES ('retry', ?)",
-                     (str(time.time() + _RETRY_GAP),))
+        gap = _RETRY_GAP
+        if _meta(conn, 'modified') is None:
+            last = _meta(conn, 'retry_gap')
+            gap = min(float(last) * 2, _RETRY_GAP) if last else _CHECK_GAP
+            conn.execute("INSERT OR REPLACE INTO meta VALUES ('retry_gap', ?)", (str(gap),))
+        conn.execute("INSERT OR REPLACE INTO meta VALUES ('retry', ?)", (str(time.time() + gap),))
     conn.execute('RELEASE reload')
     return loaded
 
